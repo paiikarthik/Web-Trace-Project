@@ -319,14 +319,19 @@ class Batch:
         return len(self.urls)
 
 
+
 def make_batch(urls, feat_df: pd.DataFrame, cols: List[str], scaler: Optional[StandardScaler], y=None,
                encode: bool = True) -> Batch:
-    X = feat_df[cols + ["TLD_cat"]].reset_index(drop=True)
+
+    X = feat_df[cols + ["TLD_cat", "group_domain"]].reset_index(drop=True)
+
     tab = scaler.transform(X[cols]).astype(np.float32) if scaler is not None else np.zeros((len(X), len(cols)), np.float32)
+
     if encode:
         seq, lens = encode_urls(list(urls))
-    else:                                           # tabular-only runs (e.g. CV): skip slow character encoding
+    else:
         seq, lens = torch.zeros((len(X), 1), dtype=torch.long), torch.ones(len(X), dtype=torch.long)
+
     return Batch(list(urls), X, tab, seq, lens, None if y is None else np.asarray(y))
 
 
@@ -633,7 +638,7 @@ TRAINERS: Dict[str, Callable] = {
 LGBM, CNN, ENS, SUPER_ENS = "4. LightGBM", "7. Char-CNN", "11. Ensemble LGBM+CNN", "11b. Super Ensemble"
 
 
-# ==============================================================================
+# =============================================  =================================
 # 5. CALIBRATION + METRICS
 # ==============================================================================
 def _logit(p):
