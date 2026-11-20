@@ -15,7 +15,7 @@ Created on Tue Nov 17 11:27:59 2026
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Website Trust Score Pipeline (URL-only, zero scraping)
+Website Trust Score Pipeline (URL-only, zero scraping) - leakage-safe external validation
 ======================================================
 
 Gap 1  Unseen-domain generalization : random vs domain-disjoint vs cross-dataset evaluation
@@ -178,17 +178,7 @@ def shannon_entropy(text: str) -> float:
 
 def canonicalize(url: str) -> str:
     u = SCHEME_RE.sub("", str(url).strip())
-    u = re.sub(r"^www\.", "", u, flags=re.I)
-    # Normalise empty root path: 'domain.com/' -> 'domain.com'
-    # External evaluation datasets (e.g. Dataset.csv) store base websites with a trailing
-    # root slash ('domain.com/'), whereas the model was trained on bare domains ('domain.com').
-    # In URI semantics (RFC 3986), an authority with an empty path is equivalent to '/'.
-    # Normalising bare root slashes prevents false-alarm triggers caused by trailing-slash artifacts.
-    if "/" in u:
-        parts = u.split("/", 1)
-        if not parts[1] or parts[1] == "/":
-            u = parts[0]
-    return u
+    return re.sub(r"^www\.", "", u, flags=re.I)
 
 
 def parse_host(host: str) -> dict:
@@ -1986,75 +1976,104 @@ def cmd_score(args):
 
 
 def evaluate_external_saved_model(csv_path, artifact_folder, training_csv):
-    """Evaluate saved artifacts on external data without refitting anything.
-
-    Important: raw probabilities measure ranking/discrimination. The saved
-    isotonic calibrator is reported separately because it may collapse many
-    different raw scores to the same calibrated value under distribution shift.
-    External labels are NEVER used to fit a model, calibrator, or threshold.
     """
-    print("\n[EXTERNAL VALIDATION] Loading saved model...")
+    Independent external evaluation of an already-trained WebTrust model.
+
+    Leakage protections:
+      * Never fit/re-fit a model or calibrator here.
+      * Never choose a threshold from external labels.
+      * Never estimate a deployment prior from external labels for correction.
+      * Use the existing, frozen calibrated-probability operating point (0.50).
+      * Use external labels only after inference, for final metric calculation.
+
+    IMPORTANT:
+      The 0.50 threshold is the existing operating point used by this pipeline.
+      This function does not claim it is the globally optimal threshold.
+    """
+    print("\\n[EXTERNAL VALIDATION - LEAKAGE-SAFE] Loading saved model...")
     art = load_artifacts(artifact_folder)
     cols = list(art["cols"])
     scaler = art["scaler"]
 
+    # This is the pre-existing operating point used by score_with_models().
+    # It is frozen before reading or evaluating external labels.
+    FIXED_CALIBRATED_THRESHOLD = 0.50
+
     print("    Ensemble enabled:", art["use_ens"])
     print("    Expected features:", len(cols))
+    print("    Frozen calibrated threshold:", FIXED_CALIBRATED_THRESHOLD)
 
-    # Step 1: Validate the saved model's expected positive class.
+    # 1. Validate model classes and artifact dimensions.
     model_classes = np.asarray(getattr(art["lgbm"], "classes_", []))
-    if model_classes.size and not np.array_equal(model_classes, np.array([0, 1])):
+    if model_classes.size != 2 or 1 not in model_classes:
         raise ValueError(
-            f"Unexpected LightGBM class order {model_classes.tolist()}; expected [0, 1] "
-            "with class 1 = phishing. Do not silently use predict_proba[:, 1]."
+            f"Expected a binary LightGBM model containing class 1 (phishing); "
+            f"found classes={model_classes.tolist()}."
         )
+    positive_idx = int(np.where(model_classes == 1)[0][0])
+
     model_n_features = getattr(art["lgbm"], "n_features_in_", None)
     if model_n_features is not None and int(model_n_features) != len(cols):
         raise ValueError(
-            f"Artifact mismatch: LightGBM expects {model_n_features} features, "
-            f"but artifact cols contains {len(cols)}."
+            f"Artifact mismatch: model expects {model_n_features} features, "
+            f"but artifact contains {len(cols)}."
         )
     if len(cols) != len(set(cols)):
-        raise ValueError("Artifact feature list contains duplicate column names.")
+        raise ValueError("Artifact feature list contains duplicate feature names.")
 
-    # Step 2: Load external data and enforce the documented label convention.
+    # 2. Load and validate external CSV.
     df = pd.read_csv(csv_path)
     required = {"url", "label"}
     missing = required - set(df.columns)
     if missing:
-        raise ValueError(f"External CSV missing columns: {sorted(missing)}")
+        raise ValueError(f"External CSV is missing required columns: {sorted(missing)}")
 
     df = df.dropna(subset=["url", "label"]).copy()
     df["url"] = df["url"].astype(str).str.strip()
     df["label"] = pd.to_numeric(df["label"], errors="coerce")
     df = df.dropna(subset=["label"])
     if not df["label"].isin([0, 1]).all():
-        raise ValueError("External labels must be binary 0 or 1.")
-
-    # Dataset.csv convention expected here: 0 = legitimate, 1 = phishing.
-    # Verify this against the dataset's original documentation before reporting results.
+        raise ValueError("External labels must contain only binary values 0 and 1.")
     df["label"] = df["label"].astype(int)
-    print("    External label mapping assumed: 0=legitimate, 1=phishing")
 
-    # Step 3: Canonicalize and deduplicate URLs while keeping labels aligned.
-    df["_url_key"] = df["url"].map(lambda u: canonicalize(u).lower())
-    df = df[df["_url_key"] != ""].drop_duplicates("_url_key").reset_index(drop=True)
+    # Dataset convention used by this evaluation: 0=legitimate, 1=phishing.
+    # Confirm this mapping against the dataset publisher's documentation.
+    print("    External label convention assumed: 0=legitimate, 1=phishing")
+
+    # 3. Canonicalize and detect contradictory duplicate labels.
+    # Canonicalization intentionally matches train_modell5.py, which created
+    # the saved feature/model artifacts. Do not silently change preprocessing.
+    df["_url_key"] = df["url"].map(lambda value: canonicalize(value).lower())
+    df = df[df["_url_key"] != ""].copy()
+
+    conflicting = df.groupby("_url_key")["label"].nunique()
+    conflicting = conflicting[conflicting > 1]
+    if len(conflicting):
+        raise ValueError(
+            f"Found {len(conflicting)} canonical URLs with conflicting labels. "
+            "Resolve these records before reporting external metrics."
+        )
+
+    df = df.drop_duplicates("_url_key", keep="first").reset_index(drop=True)
     urls = df["url"].tolist()
     y = df["label"].to_numpy(dtype=int)
-    if len(np.unique(y)) != 2:
-        raise ValueError("Both classes are required for external evaluation.")
+    if len(urls) == 0 or len(np.unique(y)) != 2:
+        raise ValueError("External evaluation requires non-empty data containing both classes.")
 
-    print("\n[DATASET]")
-    print("    Unique URLs:", len(urls))
-    print("    Legitimate:", int((y == 0).sum()))
-    print("    Phishing:", int((y == 1).sum()))
+    print("\\n[EXTERNAL DATASET]")
+    print("    Unique URLs:", f"{len(urls):,}")
+    print("    Legitimate:", f"{int((y == 0).sum()):,}")
+    print("    Phishing:", f"{int((y == 1).sum()):,}")
+    print("    Phishing prevalence (descriptive only):", f"{y.mean():.4%}")
+    print("    NOTE: prevalence is NOT used to modify predictions.")
 
-    # Step 4: Check exact URL and registrable-domain overlap with training data.
+    # 4. Build overlap masks using the same training URL/domain parsing.
     train_df = pd.read_csv(training_csv)
     if "URL" not in train_df.columns:
-        raise ValueError("Training CSV must contain the URL column.")
+        raise ValueError("Training CSV must contain the 'URL' column.")
+
     train_urls = train_df["URL"].dropna().astype(str).tolist()
-    train_url_keys = {canonicalize(u).lower() for u in train_urls}
+    train_url_keys = {canonicalize(value).lower() for value in train_urls}
     train_features = extract_features(train_urls)
     train_domains = set(train_features["group_domain"].astype(str))
 
@@ -2064,343 +2083,204 @@ def evaluate_external_saved_model(csv_path, artifact_folder, training_csv):
     domain_overlap = external_domains.isin(train_domains).to_numpy()
     unseen_domain_mask = ~domain_overlap
 
-    print("\n[OVERLAP CHECK]")
-    print("    Exact URL overlap:", int(exact_overlap.sum()))
-    print("    Domain overlap:", int(domain_overlap.sum()))
-    print("    Unseen-domain URLs:", int(unseen_domain_mask.sum()))
+    print("\\n[OVERLAP CHECK]")
+    print("    Exact URL overlap:", f"{int(exact_overlap.sum()):,}")
+    print("    Domain overlap:", f"{int(domain_overlap.sum()):,}")
+    print("    Unseen-domain URLs:", f"{int(unseen_domain_mask.sum()):,}")
 
-    # Step 5: Check feature names, order, types, and finite values before inference.
-    missing_features = [c for c in cols if c not in ext_features.columns]
+    # 5. Validate exact feature names/order and numeric values.
+    missing_features = [name for name in cols if name not in ext_features.columns]
     if missing_features:
-        raise ValueError(f"Missing model features: {missing_features}")
-    non_numeric = [c for c in cols if not pd.api.types.is_numeric_dtype(ext_features[c])]
-    if non_numeric:
-        raise TypeError(f"Model features must be numeric; found: {non_numeric}")
+        raise ValueError(f"Feature extractor is missing model features: {missing_features}")
+
     feature_matrix = ext_features.loc[:, cols]
+    if not all(pd.api.types.is_numeric_dtype(feature_matrix[name]) for name in cols):
+        raise TypeError("One or more model features are not numeric.")
     if not np.isfinite(feature_matrix.to_numpy(dtype=np.float64)).all():
         raise ValueError("External feature matrix contains NaN or infinite values.")
-    print("    Feature order check: passed (artifact column order used)")
+
+    print("    Feature order check: passed")
     print("    Feature matrix shape:", feature_matrix.shape)
 
-    # Step 6: Infer raw probabilities from each model and the ensemble.
-    # The training script defines the ensemble as the arithmetic mean of the
-    # uncalibrated LightGBM and Char-CNN probabilities.
-    p_lgbm_all, p_cnn_all, p_raw_all, p_cal_all = [], [], [], []
+    # 6. Inference only. No external labels are passed into the model or calibrator.
+    p_lgbm_parts, p_cnn_parts, p_raw_parts, p_cal_parts = [], [], [], []
     batch_size = 2048
+
     for start in range(0, len(urls), batch_size):
         end = min(start + batch_size, len(urls))
-        batch_urls = urls[start:end]
-        batch_features = ext_features.iloc[start:end].reset_index(drop=True)
-        batch = make_batch(batch_urls, batch_features, cols, scaler)
+        batch = make_batch(
+            urls[start:end],
+            ext_features.iloc[start:end].reset_index(drop=True),
+            cols,
+            scaler
+        )
 
-        # Explicitly select class 1 (phishing), rather than assuming its position.
-        classes = np.asarray(art["lgbm"].classes_)
-        positive_idx = int(np.where(classes == 1)[0][0])
         p_lgbm = art["lgbm"].predict_proba(batch.X[cols])[:, positive_idx]
         p_cnn = predict_torch(art["cnn"], batch)
-        p_raw = 0.5 * (p_lgbm + p_cnn) if art["use_ens"] else p_lgbm
 
-        # Do not refit the calibrator on external labels.
+        if art["use_ens"]:
+            p_raw = 0.5 * (p_lgbm + p_cnn)
+        else:
+            p_raw = p_lgbm
+
+        # Frozen calibrator: prediction only, never fit on external labels.
         p_cal = np.clip(art["iso_final"].predict(p_raw), 0.0, 1.0)
-        for name, values in (("LightGBM", p_lgbm), ("Char-CNN", p_cnn),
-                             ("raw ensemble", p_raw), ("calibrated", p_cal)):
-            if not np.isfinite(values).all() or np.any((values < 0) | (values > 1)):
-                raise ValueError(f"{name} produced invalid probabilities.")
 
-        p_lgbm_all.extend(p_lgbm)
-        p_cnn_all.extend(p_cnn)
-        p_raw_all.extend(p_raw)
-        p_cal_all.extend(p_cal)
-        print(f"    Processed {end:,}/{len(urls):,} URLs", flush=True)
+        for name, values in (
+            ("LightGBM", p_lgbm),
+            ("Char-CNN", p_cnn),
+            ("raw model score", p_raw),
+            ("calibrated probability", p_cal),
+        ):
+            if not np.isfinite(values).all():
+                raise ValueError(f"{name} produced NaN or infinite values.")
+            if np.any((values < 0.0) | (values > 1.0)):
+                raise ValueError(f"{name} produced values outside [0, 1].")
 
-    p_lgbm_all = np.asarray(p_lgbm_all, dtype=float)
-    p_cnn_all = np.asarray(p_cnn_all, dtype=float)
-    p_raw_all = np.asarray(p_raw_all, dtype=float)
-    p_cal_all = np.asarray(p_cal_all, dtype=float)
+        p_lgbm_parts.append(p_lgbm)
+        p_cnn_parts.append(p_cnn)
+        p_raw_parts.append(p_raw)
+        p_cal_parts.append(p_cal)
+        print(f"    Inference: {end:,}/{len(urls):,} URLs", flush=True)
 
-    # Step 7: Probability summaries reveal saturation and distribution shift.
+    p_lgbm_all = np.concatenate(p_lgbm_parts)
+    p_cnn_all = np.concatenate(p_cnn_parts)
+    p_raw_all = np.concatenate(p_raw_parts)
+    p_cal_all = np.concatenate(p_cal_parts)
+
+    # 7. Probability-distribution diagnostics (descriptive; no tuning).
     def print_probability_summary(name, values):
-        q = np.quantile(values, [0, .01, .05, .25, .50, .75, .95, .99, 1])
-        print(f"\n{name} probability summary")
+        quantiles = np.quantile(values, [0, .01, .05, .25, .50, .75, .95, .99, 1])
+        print(f"\\n{name} probability summary")
         print("    min / p01 / p05 / p25 / median / p75 / p95 / p99 / max:")
-        print("   ", " / ".join(f"{v:.4f}" for v in q))
-        print(f"    >= 0.50: {int((values >= .50).sum()):,} ({(values >= .50).mean():.2%})")
-        print(f"    >= 0.99: {int((values >= .99).sum()):,} ({(values >= .99).mean():.2%})")
-        print(f"    <= 0.01: {int((values <= .01).sum()):,} ({(values <= .01).mean():.2%})")
+        print("    " + " / ".join(f"{v:.4f}" for v in quantiles))
+        print(f"    >=0.50: {(values >= .50).sum():,} ({(values >= .50).mean():.2%})")
+        print(f"    >=0.99: {(values >= .99).sum():,} ({(values >= .99).mean():.2%})")
+        print(f"    <=0.01: {(values <= .01).sum():,} ({(values <= .01).mean():.2%})")
 
     print_probability_summary("LightGBM raw", p_lgbm_all)
     print_probability_summary("Char-CNN raw", p_cnn_all)
-    print_probability_summary("Ensemble raw", p_raw_all)
-    print_probability_summary("Isotonic calibrated", p_cal_all)
+    print_probability_summary("Ensemble/model raw", p_raw_all)
+    print_probability_summary("Saved isotonic calibrated", p_cal_all)
 
-    # ── Prior-corrected threshold selection ──────────────────────────────────────
-    # The model was trained on ~50% phishing; the external dataset has a very
-    # different prevalence. Sweeping the raw-score threshold removes the
-    # calibration-prior mismatch without touching any fitted parameters.
-    deploy_prior = float(y.mean())
-    print(f"\n[THRESHOLD ANALYSIS]")
-    print(f"    Deployment prior (phishing rate): {deploy_prior:.4f} ({deploy_prior:.1%})")
-    print(f"    Training prior assumed:           ~0.50 (50%)")
-    print(f"    Threshold mismatch correction running on raw ensemble scores ...")
+    # 8. Metrics: external labels are used ONLY here, after predictions are frozen.
+    def safe_auc(metric_fn, labels, probabilities):
+        if len(np.unique(labels)) < 2:
+            return float("nan")
+        try:
+            return float(metric_fn(labels, probabilities))
+        except Exception:
+            return float("nan")
 
-    thresholds = np.linspace(0.0, 1.0, 1001)
-    f1_scores_thr = []
-    prec_scores_thr = []
-    rec_scores_thr = []
-    for thr in thresholds:
-        pred_thr = (p_raw_all >= thr).astype(int)
-        tp = int(((pred_thr == 1) & (y == 1)).sum())
-        fp = int(((pred_thr == 1) & (y == 0)).sum())
-        fn = int(((pred_thr == 0) & (y == 1)).sum())
-        prec_v = tp / max(tp + fp, 1)
-        rec_v  = tp / max(tp + fn, 1)
-        f1_v   = 2 * prec_v * rec_v / max(prec_v + rec_v, 1e-9)
-        f1_scores_thr.append(f1_v)
-        prec_scores_thr.append(prec_v)
-        rec_scores_thr.append(rec_v)
-
-    f1_scores_thr  = np.array(f1_scores_thr)
-    prec_scores_thr = np.array(prec_scores_thr)
-    rec_scores_thr  = np.array(rec_scores_thr)
-
-    best_f1_idx = int(np.argmax(f1_scores_thr))
-    best_f1_thr = float(thresholds[best_f1_idx])
-    best_f1_val = float(f1_scores_thr[best_f1_idx])
-
-    # Threshold that achieves >= 90% recall with best precision
-    rec90_mask = rec_scores_thr >= 0.90
-    if rec90_mask.any():
-        rec90_prec = prec_scores_thr.copy()
-        rec90_prec[~rec90_mask] = -1
-        rec90_idx = int(np.argmax(rec90_prec))
-        thr_at_rec90 = float(thresholds[rec90_idx])
-        prec_at_rec90 = float(prec_scores_thr[rec90_idx])
-        rec_at_rec90  = float(rec_scores_thr[rec90_idx])
-    else:
-        thr_at_rec90 = 0.5
-        prec_at_rec90 = float(prec_scores_thr[500])
-        rec_at_rec90  = float(rec_scores_thr[500])
-
-    print(f"    Best-F1 threshold (raw ensemble): {best_f1_thr:.3f}  =>  F1={best_f1_val:.4f}")
-    print(f"    @90% recall threshold (raw):      {thr_at_rec90:.3f}  =>  Prec={prec_at_rec90:.4f}, Rec={rec_at_rec90:.4f}")
-
-    # Bayes prior-shift correction on raw probabilities
-    # If model was trained at prior p0 but deployed at p1:
-    # p_corrected = p / (p + (1-p) * r)  where r = (1-p1)/p1 * p0/(1-p0)
-    p0_train = 0.50   # training phishing prior
-    p1_deploy = deploy_prior
-    r_shift = ((1.0 - p1_deploy) / max(p1_deploy, 1e-9)) * (p0_train / (1.0 - p0_train))
-    p_raw_shifted = p_raw_all / (p_raw_all + (1.0 - p_raw_all) * r_shift + 1e-15)
-    p_raw_shifted = np.clip(p_raw_shifted, 0.0, 1.0)
-
-    # Sweep F1 on prior-shifted scores
-    f1_shifted = []
-    for thr in thresholds:
-        pred_thr = (p_raw_shifted >= thr).astype(int)
-        tp = int(((pred_thr == 1) & (y == 1)).sum())
-        fp = int(((pred_thr == 1) & (y == 0)).sum())
-        fn = int(((pred_thr == 0) & (y == 1)).sum())
-        prec_v = tp / max(tp + fp, 1)
-        rec_v  = tp / max(tp + fn, 1)
-        f1_v   = 2 * prec_v * rec_v / max(prec_v + rec_v, 1e-9)
-        f1_shifted.append(f1_v)
-    f1_shifted = np.array(f1_shifted)
-    best_shifted_idx = int(np.argmax(f1_shifted))
-    best_shifted_thr = float(thresholds[best_shifted_idx])
-    best_shifted_f1  = float(f1_shifted[best_shifted_idx])
-    print(f"    Bayes-prior-shifted best-F1 thr:  {best_shifted_thr:.3f}  =>  F1={best_shifted_f1:.4f}")
-
-    # Step 8: Report discrimination on RAW scores separately from calibration.
-    # Isotonic regression is monotonic but can create many ties, reducing measured AUC.
-    def calculate_metrics(indices, title):
+    def metric_row(indices, dataset_name):
         indices = np.asarray(indices, dtype=int)
         yt = y[indices]
         raw = p_raw_all[indices]
         cal = p_cal_all[indices]
-        pred = (cal >= 0.5).astype(int)  # fixed existing operating point; not tuned on external labels
+
+        # Frozen decision rule; it is not optimized on the external dataset.
+        pred = (cal >= FIXED_CALIBRATED_THRESHOLD).astype(int)
         tn, fp, fn, tp = confusion_matrix(yt, pred, labels=[0, 1]).ravel()
 
-        result = {
-            "Dataset": title,
-            "N": len(yt),
-            "Phishing": int(yt.sum()),
-            "Legitimate": int((yt == 0).sum()),
-            "Accuracy_cal_0_5": accuracy_score(yt, pred),
-            "Precision_cal_0_5": precision_score(yt, pred, zero_division=0),
-            "Recall_cal_0_5": recall_score(yt, pred, zero_division=0),
-            "F1_cal_0_5": f1_score(yt, pred, zero_division=0),
-            "TN_cal_0_5": int(tn), "FP_cal_0_5": int(fp),
-            "FN_cal_0_5": int(fn), "TP_cal_0_5": int(tp),
-            "ROC_AUC_raw": roc_auc_score(yt, raw),
-            "PR_AUC_raw": average_precision_score(yt, raw),
-            "Brier_raw": brier_score_loss(yt, raw),
-            "LogLoss_raw": log_loss(yt, np.clip(raw, 1e-7, 1 - 1e-7), labels=[0, 1]),
-            "ECE_raw": compute_ece(yt, raw),
-            "ROC_AUC_calibrated": roc_auc_score(yt, cal),
-            "PR_AUC_calibrated": average_precision_score(yt, cal),
-            "Brier_calibrated": brier_score_loss(yt, cal),
-            "LogLoss_calibrated": log_loss(yt, np.clip(cal, 1e-7, 1 - 1e-7), labels=[0, 1]),
-            "ECE_calibrated": compute_ece(yt, cal),
-            "Calibrated_fraction_ge_0_99": float(np.mean(cal >= 0.99)),
-            "Calibrated_fraction_ge_0_50": float(np.mean(cal >= 0.50)),
+        n_legit = int((yt == 0).sum())
+        n_phish = int((yt == 1).sum())
+        specificity = tn / max(tn + fp, 1)
+        sensitivity = tp / max(tp + fn, 1)
+        clipped_cal = np.clip(cal, 1e-7, 1 - 1e-7)
+        clipped_raw = np.clip(raw, 1e-7, 1 - 1e-7)
+
+        row = {
+            "Dataset": dataset_name,
+            "N": int(len(indices)),
+            "Legitimate": n_legit,
+            "Phishing": n_phish,
+            "Phishing_prevalence_descriptive": float(yt.mean()),
+            "Frozen_threshold_calibrated": FIXED_CALIBRATED_THRESHOLD,
+            "Accuracy": float(accuracy_score(yt, pred)),
+            "Balanced_accuracy": float(balanced_accuracy_score(yt, pred)),
+            "Precision": float(precision_score(yt, pred, zero_division=0)),
+            "Recall_TPR": float(recall_score(yt, pred, zero_division=0)),
+            "Specificity_TNR": float(specificity),
+            "FPR": float(1.0 - specificity),
+            "FNR": float(1.0 - sensitivity),
+            "F1": float(f1_score(yt, pred, zero_division=0)),
+            "MCC": float(matthews_corrcoef(yt, pred)) if len(np.unique(pred)) > 1 else 0.0,
+            "TN": int(tn), "FP": int(fp), "FN": int(fn), "TP": int(tp),
+            "ROC_AUC_raw": safe_auc(roc_auc_score, yt, raw),
+            "PR_AUC_raw": safe_auc(average_precision_score, yt, raw),
+            "ROC_AUC_calibrated": safe_auc(roc_auc_score, yt, cal),
+            "PR_AUC_calibrated": safe_auc(average_precision_score, yt, cal),
+            "Brier_raw": float(brier_score_loss(yt, raw)),
+            "LogLoss_raw": float(log_loss(yt, clipped_raw, labels=[0, 1])),
+            "ECE_raw": float(compute_ece(yt, raw)),
+            "Brier_calibrated": float(brier_score_loss(yt, cal)),
+            "LogLoss_calibrated": float(log_loss(yt, clipped_cal, labels=[0, 1])),
+            "ECE_calibrated": float(compute_ece(yt, cal)),
+            "Calibrated_fraction_ge_0_99": float(np.mean(cal >= .99)),
+            "Calibrated_fraction_ge_0_50": float(np.mean(cal >= .50)),
+            "All_legitimate_accuracy_baseline": float(n_legit / max(len(yt), 1)),
         }
-        print("\n" + "=" * 72)
-        print(title)
-        print("=" * 72)
-        for key, value in result.items():
+        print("\\n" + "=" * 76)
+        print(dataset_name)
+        print("=" * 76)
+        for key, value in row.items():
             if isinstance(value, (float, np.floating)):
-                print(f"{key:32s}: {value:.4f}")
+                print(f"{key:38s}: {value:.5f}")
             else:
-                print(f"{key:32s}: {value}")
-        return result
-
-    def calculate_metrics_v2(indices, title, threshold_raw=0.5, threshold_shifted=0.5):
-        """
-        Extended metrics using both fixed 0.5 on calibrated AND
-        the prior-corrected thresholds on raw/shifted probabilities.
-        """
-        indices = np.asarray(indices, dtype=int)
-        yt   = y[indices]
-        raw  = p_raw_all[indices]
-        cal  = p_cal_all[indices]
-        shf  = p_raw_shifted[indices]
-
-        def _cm(probs, thr):
-            pred = (probs >= thr).astype(int)
-            tn, fp, fn, tp = confusion_matrix(yt, pred, labels=[0, 1]).ravel()
-            prec = tp / max(tp + fp, 1)
-            rec  = tp / max(tp + fn, 1)
-            f1   = 2 * prec * rec / max(prec + rec, 1e-9)
-            acc  = (tp + tn) / max(len(yt), 1)
-            return dict(tn=int(tn), fp=int(fp), fn=int(fn), tp=int(tp),
-                        precision=prec, recall=rec, f1=f1, accuracy=acc)
-
-        r_cal    = _cm(cal, 0.5)           # original: calibrated @ 0.5
-        r_raw    = _cm(raw, threshold_raw) # raw ensemble @ best-F1 threshold
-        r_shf    = _cm(shf, threshold_shifted)  # prior-shifted @ best-F1 threshold
-
-        result = {
-            "Dataset":               title,
-            "N":                     len(yt),
-            "Phishing":              int(yt.sum()),
-            "Legitimate":            int((yt == 0).sum()),
-            # --- original (calibrated @ 0.5) ---
-            "Accuracy_cal_0_5":      r_cal["accuracy"],
-            "Precision_cal_0_5":     r_cal["precision"],
-            "Recall_cal_0_5":        r_cal["recall"],
-            "F1_cal_0_5":            r_cal["f1"],
-            "TN_cal_0_5":            r_cal["tn"],
-            "FP_cal_0_5":            r_cal["fp"],
-            "FN_cal_0_5":            r_cal["fn"],
-            "TP_cal_0_5":            r_cal["tp"],
-            # --- raw @ best-F1 threshold ---
-            "Accuracy_raw_bestF1":   r_raw["accuracy"],
-            "Precision_raw_bestF1":  r_raw["precision"],
-            "Recall_raw_bestF1":     r_raw["recall"],
-            "F1_raw_bestF1":         r_raw["f1"],
-            "TN_raw_bestF1":         r_raw["tn"],
-            "FP_raw_bestF1":         r_raw["fp"],
-            "FN_raw_bestF1":         r_raw["fn"],
-            "TP_raw_bestF1":         r_raw["tp"],
-            "Threshold_raw_bestF1":  threshold_raw,
-            # --- prior-shifted @ best-F1 threshold ---
-            "Accuracy_shifted_bestF1":  r_shf["accuracy"],
-            "Precision_shifted_bestF1": r_shf["precision"],
-            "Recall_shifted_bestF1":    r_shf["recall"],
-            "F1_shifted_bestF1":        r_shf["f1"],
-            "TN_shifted_bestF1":        r_shf["tn"],
-            "FP_shifted_bestF1":        r_shf["fp"],
-            "FN_shifted_bestF1":        r_shf["fn"],
-            "TP_shifted_bestF1":        r_shf["tp"],
-            "Threshold_shifted_bestF1": threshold_shifted,
-            # --- discrimination (AUC) on raw probabilities ---
-            "ROC_AUC_raw":           roc_auc_score(yt, raw),
-            "PR_AUC_raw":            average_precision_score(yt, raw),
-            "ROC_AUC_calibrated":    roc_auc_score(yt, cal),
-            "PR_AUC_calibrated":     average_precision_score(yt, cal),
-            "Brier_raw":             brier_score_loss(yt, raw),
-            "LogLoss_raw":           log_loss(yt, np.clip(raw, 1e-7, 1 - 1e-7), labels=[0, 1]),
-            "ECE_raw":               compute_ece(yt, raw),
-            "Brier_calibrated":      brier_score_loss(yt, cal),
-            "LogLoss_calibrated":    log_loss(yt, np.clip(cal, 1e-7, 1 - 1e-7), labels=[0, 1]),
-            "ECE_calibrated":        compute_ece(yt, cal),
-            "Calibrated_fraction_ge_0_99": float(np.mean(cal >= 0.99)),
-            "Calibrated_fraction_ge_0_50": float(np.mean(cal >= 0.50)),
-            "Deploy_prior":          float(yt.mean()),
-            "Best_F1_raw_threshold": threshold_raw,
-            "Best_F1_shifted_threshold": threshold_shifted,
-        }
-        print("\n" + "=" * 72)
-        print(title)
-        print("=" * 72)
-        print(f"\n  [A] Original method: calibrated probability @ threshold=0.50")
-        print(f"      Accuracy={r_cal['accuracy']:.4f}  Precision={r_cal['precision']:.4f}  Recall={r_cal['recall']:.4f}  F1={r_cal['f1']:.4f}")
-        print(f"      TP={r_cal['tp']:,}  TN={r_cal['tn']:,}  FP={r_cal['fp']:,}  FN={r_cal['fn']:,}")
-        print(f"\n  [B] Improved: raw ensemble @ best-F1 threshold={threshold_raw:.3f}")
-        print(f"      Accuracy={r_raw['accuracy']:.4f}  Precision={r_raw['precision']:.4f}  Recall={r_raw['recall']:.4f}  F1={r_raw['f1']:.4f}")
-        print(f"      TP={r_raw['tp']:,}  TN={r_raw['tn']:,}  FP={r_raw['fp']:,}  FN={r_raw['fn']:,}")
-        print(f"\n  [C] Best: Bayes-prior-shifted @ best-F1 threshold={threshold_shifted:.3f}")
-        print(f"      Accuracy={r_shf['accuracy']:.4f}  Precision={r_shf['precision']:.4f}  Recall={r_shf['recall']:.4f}  F1={r_shf['f1']:.4f}")
-        print(f"      TP={r_shf['tp']:,}  TN={r_shf['tn']:,}  FP={r_shf['fp']:,}  FN={r_shf['fn']:,}")
-        print(f"\n  ROC-AUC (raw)={result['ROC_AUC_raw']:.4f}  PR-AUC (raw)={result['PR_AUC_raw']:.4f}")
-        return result
+                print(f"{key:38s}: {value}")
+        return row
 
     all_indices = np.arange(len(urls))
-    results = [calculate_metrics_v2(
-        all_indices,
-        "External dataset - all unique URLs",
-        threshold_raw=best_f1_thr,
-        threshold_shifted=best_shifted_thr,
-    )]
-    unseen_indices = np.where(unseen_domain_mask)[0]
-    if len(unseen_indices) and len(np.unique(y[unseen_indices])) == 2:
-        results.append(calculate_metrics_v2(
-            unseen_indices,
-            "External dataset - unseen domains",
-            threshold_raw=best_f1_thr,
-            threshold_shifted=best_shifted_thr,
-        ))
+    results = [metric_row(all_indices, "External dataset - all unique URLs")]
+
+    unseen_indices = np.flatnonzero(unseen_domain_mask)
+    if len(unseen_indices) > 0 and len(np.unique(y[unseen_indices])) == 2:
+        results.append(metric_row(unseen_indices, "External dataset - unseen domains"))
     else:
-        print("\nUnseen-domain subset has insufficient class diversity.")
+        print("\\nWARNING: unseen-domain subset does not contain both classes; AUC/F1 interpretation is limited.")
 
-    # Step 9: Save auditable row-level predictions, including component scores.
+    # 9. Save predictions and metrics. These outputs contain only frozen decisions.
     os.makedirs(artifact_folder, exist_ok=True)
-    pd.DataFrame(results).to_csv(
-        os.path.join(artifact_folder, "external_validation_metrics_v2.csv"), index=False
-    )
-    prediction_df = pd.DataFrame({
-        "url":                             urls,
-        "actual_label":                    y,
-        "lgbm_raw_phishing_probability":   p_lgbm_all,
-        "cnn_raw_phishing_probability":    p_cnn_all,
-        "ensemble_raw_phishing_probability": p_raw_all,
-        "isotonic_phishing_probability":   p_cal_all,
-        "prior_shifted_probability":       p_raw_shifted,
-        "trust_score_from_isotonic":       np.rint(100 * (1 - p_cal_all)).astype(int),
-        "predicted_label_cal_0_5":         (p_cal_all >= 0.5).astype(int),
-        "predicted_label_raw_bestF1":      (p_raw_all >= best_f1_thr).astype(int),
-        "predicted_label_shifted_bestF1":  (p_raw_shifted >= best_shifted_thr).astype(int),
-        "domain_overlap":                  domain_overlap,
-        "exact_url_overlap":               exact_overlap,
-    })
-    prediction_df.to_csv(
-        os.path.join(artifact_folder, "external_validation_predictions_v2.csv"), index=False
-    )
+    metrics_path = os.path.join(artifact_folder, "external_validation_metrics_FIXED.csv")
+    predictions_path = os.path.join(artifact_folder, "external_validation_predictions_FIXED.csv")
 
-    # Step 10: Save the isotonic mapping itself to inspect out-of-range clipping.
+    pd.DataFrame(results).to_csv(metrics_path, index=False)
+
+    prediction_df = pd.DataFrame({
+        "url": urls,
+        "actual_label": y,
+        "lgbm_raw_phishing_probability": p_lgbm_all,
+        "cnn_raw_phishing_probability": p_cnn_all,
+        "ensemble_raw_phishing_probability": p_raw_all,
+        "saved_isotonic_phishing_probability": p_cal_all,
+        "model_only_trust_score": np.rint(100.0 * (1.0 - p_cal_all)).astype(int),
+        "predicted_label_frozen_calibrated_0_50": (p_cal_all >= FIXED_CALIBRATED_THRESHOLD).astype(int),
+        "domain_overlap": domain_overlap,
+        "exact_url_overlap": exact_overlap,
+        "unseen_domain": unseen_domain_mask,
+    })
+    prediction_df.to_csv(predictions_path, index=False)
+
+    # 10. Export saved isotonic mapping for audit; do not refit it.
     iso = art["iso_final"]
     if hasattr(iso, "X_thresholds_") and hasattr(iso, "y_thresholds_"):
+        mapping_path = os.path.join(artifact_folder, "isotonic_calibration_mapping_FIXED.csv")
         pd.DataFrame({
             "raw_probability_threshold": iso.X_thresholds_,
             "calibrated_probability": iso.y_thresholds_,
-        }).to_csv(os.path.join(artifact_folder, "isotonic_calibration_mapping.csv"), index=False)
-        print("\nIsotonic training range:",
+        }).to_csv(mapping_path, index=False)
+        print("\\nSaved isotonic raw-score range:",
               f"{float(np.min(iso.X_thresholds_)):.6f} to {float(np.max(iso.X_thresholds_)):.6f}")
-        print("External raw probabilities outside this range are clipped by the saved calibrator.")
 
-    print("\nExternal validation completed.")
-    print("Saved metrics:", os.path.join(artifact_folder, "external_validation_metrics_v2.csv"))
-    print("Saved predictions:", os.path.join(artifact_folder, "external_validation_predictions_v2.csv"))
+    print("\\n[LEAKAGE CHECK]")
+    print("    External labels used for model fitting: NO")
+    print("    External labels used for calibrator fitting: NO")
+    print("    External labels used for threshold selection: NO")
+    print("    External labels used for prior correction: NO")
+    print("    External labels used only for final metrics: YES")
+    print("\\nExternal validation completed.")
+    print("Metrics saved to:", metrics_path)
+    print("Predictions saved to:", predictions_path)
 
 
 # ==============================================================================
@@ -2451,3 +2331,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+ 
